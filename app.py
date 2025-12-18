@@ -1,38 +1,36 @@
 import streamlit as st
 import google.generativeai as genai
+import pypdf
 import os
-import time
 
-# 1. 페이지 설정 및 디자인
+# 1. 페이지 설정
 st.set_page_config(page_title="GIB 정관규정집 AI 상담사", page_icon="🏢", layout="centered")
 
+# 디자인 개선 (CSS)
 st.markdown("""
     <style>
     .stApp { font-family: 'Pretendard', sans-serif; }
     .stButton > button { width: 100%; border-radius: 8px; height: 3.5em; font-weight: bold; background-color: #FF4B4B; color: white; border: none; }
     div[data-baseweb="textarea"] { border-radius: 10px; }
+    .answer-box { background-color: #1E1E1E; padding: 20px; border-radius: 10px; border-left: 5px solid #FF4B4B; }
     </style>
 """, unsafe_allow_html=True)
 
-# 2. Gemini 파일 API를 이용한 업로드 및 캐싱 (속도 핵심)
-@st.cache_resource
-def upload_to_gemini(file_path):
-    """파일을 구글 서버에 업로드하고 식별자를 반환 (딱 한 번만 실행됨)"""
+# 2. PDF 텍스트 추출 및 캐싱 (속도 최적화의 핵심)
+@st.cache_data(show_spinner=False)
+def get_pdf_text(file_path):
+    if not os.path.exists(file_path):
+        return None
     try:
-        # 파일 업로드
-        uploaded_file = genai.upload_file(path=file_path, display_name="GIB_Regulations")
-        
-        # 업로드된 파일이 처리될 때까지 대기 (보통 수 초 소요)
-        while uploaded_file.state.name == "PROCESSING":
-            time.sleep(1)
-            uploaded_file = genai.get_file(uploaded_file.name)
-            
-        if uploaded_file.state.name == "FAILED":
-            raise Exception("구글 서버 내 파일 처리 실패")
-            
-        return uploaded_file
-    except Exception as e:
-        st.error(f"파일 업로드 중 오류: {e}")
+        with open(file_path, "rb") as f:
+            pdf_reader = pypdf.PdfReader(f)
+            extracted_pages = []
+            for i, page in enumerate(pdf_reader.pages):
+                text = page.extract_text()
+                if text:
+                    extracted_pages.append(f"[페이지 {i+1}]\n{text}")
+            return "\n\n".join(extracted_pages)
+    except:
         return None
 
 def main():
@@ -41,26 +39,23 @@ def main():
     # API 설정
     api_key = st.secrets.get("GOOGLE_API_KEY")
     if not api_key:
-        st.error("🔑 API Key 설정이 필요합니다.")
+        st.error("🔑 API Key를 찾을 수 없습니다. Streamlit Cloud의 Secrets 설정을 확인하세요.")
         return
     genai.configure(api_key=api_key)
 
-    # 3. 파일 존재 확인 및 구글 서버 업로드
+    # 3. 데이터 로딩 (캐싱을 사용하여 접속 시 한 번만 실행)
     file_path = "regulations.pdf"
-    if not os.path.exists(file_path):
-        st.error(f"❌ '{file_path}' 파일을 찾을 수 없습니다.")
-        return
+    if "full_text" not in st.session_state:
+        with st.spinner("📄 규정집 데이터를 최적화 중입니다..."):
+            text = get_pdf_text(file_path)
+            if text:
+                st.session_state.full_text = text
+            else:
+                st.error("❌ 'regulations.pdf' 파일을 읽을 수 없습니다. GitHub에 파일이 있는지 확인해 주세요.")
+                return
 
-    # 구글 서버에 업로드 (캐싱 처리되어 앱 실행 시 한 번만 수행됨)
-    with st.spinner("🚀 시스템을 초기화 중입니다 (최초 1회)..."):
-        gemini_file = upload_to_gemini(file_path)
-
-    if not gemini_file:
-        return
-
-    # 4. 상담 화면 UI
+    # 4. 상담 UI 구성
     st.markdown("### 상담 분야를 선택하세요")
-    
     categories = {
         "인사 (승진, 채용, 평가)": "4급 승진을 위한 최저 소요 연수는 몇 년인가요?",
         "급여 (호봉, 수당, 퇴직금)": "가족 4명의 경우 수당 지급 기준을 알려주세요.",
@@ -80,37 +75,45 @@ def main():
         if not query:
             st.warning("질문을 입력해 주세요.")
         else:
-            with st.spinner("규정집을 분석하여 답변을 생성 중입니다..."):
+            with st.spinner("규정집을 분석하여 답변을 작성 중입니다..."):
                 try:
-                    # 에러 해결 포인트: 모델명을 가장 안정적인 'gemini-1.5-flash'로 설정
+                    # [에러 해결] 가장 안정적인 모델 호출 방식
                     model = genai.GenerativeModel('gemini-1.5-flash')
                     
                     prompt = f"""
-                    당신은 GIB 기관의 정관 및 규정 전문 상담사입니다.
-                    제공된 규정집 파일 내용을 바탕으로 사용자의 질문에 답변하세요.
+                    당신은 GIB 기관의 정관 및 규정 전문 상담사입니다. 
+                    아래 [규정집 내용]을 바탕으로만 답변하세요.
 
-                    [질문 분야]: {selected_cat}
+                    [규정집 내용]
+                    {st.session_state.full_text}
+
+                    [상담 분야]: {selected_cat}
                     [사용자 질문]: {query}
 
-                    [필수 답변 규칙]
-                    1. 정확하고 사실에 근거하여 친절하게 답변하세요.
-                    2. 반드시 해당 내용의 근거가 되는 규정 명칭과 '페이지 번호'를 명시하세요.
-                    3. 파일 내에 관련 정보가 없는 경우 "첨부된 자료에는 관련 정보가 없습니다."라고 명확히 답변하세요.
-                    4. 복잡한 절차는 번호가 매겨진 리스트 형식으로 정리하세요.
-                    5. 답변 마지막 문구는 반드시 아래 문장으로 끝내세요:
+                    [작성 규칙]
+                    1. 정확하고 사실에 근거하여 친절한 말투로 답변하세요.
+                    2. 답변 내용에 해당하는 관련 규정 명칭과 해당 [페이지 번호]를 반드시 명시하세요.
+                    3. 만약 규정집 내용에 질문과 관련된 정보가 없다면 반드시 "첨부된 자료에는 관련 정보가 없습니다."라고 답변하세요.
+                    4. 복잡한 절차나 조건은 번호가 매겨진 리스트 형태로 정리하세요.
+                    5. 답변 마지막 문구는 반드시 다음 내용을 포함하세요:
                        "세부내용은 정관규정집을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"
                     """
                     
-                    # 파일 URI를 참조하여 답변 생성 (파일 데이터를 직접 보내지 않아 매우 빠름)
-                    response = model.generate_content([gemini_file, prompt])
+                    response = model.generate_content(prompt)
                     
                     st.markdown("### 💡 답변 결과")
-                    st.info(response.text)
+                    st.markdown(f'<div class="answer-box">{response.text}</div>', unsafe_allow_html=True)
                     
                 except Exception as e:
-                    # 모델 명칭 에러 대응을 위한 대체 시도
-                    st.error(f"답변 생성 중 오류가 발생했습니다. (관리자 문의)")
-                    st.caption(f"상세 에러: {str(e)}")
+                    # 만약의 경우를 대비한 모델명 우회 로직
+                    try:
+                        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+                        response = model.generate_content(prompt)
+                        st.markdown("### 💡 답변 결과")
+                        st.markdown(f'<div class="answer-box">{response.text}</div>', unsafe_allow_html=True)
+                    except:
+                        st.error("⚠️ AI 서비스와 연결이 원활하지 않습니다. 잠시 후 다시 시도해 주세요.")
+                        st.caption(f"Error Detail: {e}")
 
 if __name__ == "__main__":
     main()
