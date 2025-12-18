@@ -71,9 +71,9 @@ def load_data_and_model():
 
 
 def generate_response(model, query, pdf_text):
-    """AI 답변 생성 및 사용자 친화적 오류 처리"""
+    """AI 답변 생성 (자동 재시도 로직 포함)"""
     
-    # ====[수정된 부분 시작]====
+    # 시스템 프롬프트 (이전과 동일)
     system_prompt = f"""
     # **당신의 역할 및 정체성**
     당신은 오직 주어진 [규정집 원문]의 내용만을 분석하고 답변하는, 고도로 정밀한 '문서 분석 AI'입니다. 당신의 목표는 사용자의 질문에 대해 100% 규정집에 근거한 정확한 정보를 제공하는 것입니다.
@@ -90,19 +90,35 @@ def generate_response(model, query, pdf_text):
     # **[규정집 원문]**
     {pdf_text}
     """
-    # ====[수정된 부분 끝]====
 
-    try:
-        ai_model = genai.GenerativeModel(model)
-        response = ai_model.generate_content(
-            [system_prompt, f"사용자 질문: {query}"], 
-            generation_config={"temperature": 0.0} # 창의성을 0으로 설정하여 사실 기반 답변 유도
-        )
-        return response.text
-    except ResourceExhausted:
-        return "⚠️ **API 사용량 한도 초과**\n\n무료 API 키의 분당 요청 횟수(RPM)를 초과했습니다. **약 1분 후에 다시 질문해주세요.**"
-    except Exception as e:
-        return f"⚠️ 답변 생성 중 오류가 발생했습니다: {e}"
+    # === [자동 재시도 로직 추가] ===
+    max_retries = 3  # 최대 3번까지 재시도
+    retry_delay = 5  # 첫 대기 시간 5초
+
+    for attempt in range(max_retries):
+        try:
+            # 모델 생성
+            ai_model = genai.GenerativeModel(model)
+            
+            # 답변 요청
+            response = ai_model.generate_content(
+                [system_prompt, f"사용자 질문: {query}"], 
+                generation_config={"temperature": 0.0}
+            )
+            return response.text
+
+        except ResourceExhausted:
+            # API 한도 초과 에러 발생 시
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (attempt + 1) # 5초, 10초, 15초... 점진적으로 대기
+                time.sleep(wait_time) # 코드 실행을 잠시 멈춤
+                continue # 다시 시도 루프로 돌아감
+            else:
+                # 3번 다 실패했을 경우
+                return "⚠️ **사용량이 많아 답변이 지연되고 있습니다.**\n\n현재 무료 API의 한도를 초과했습니다. 잠시 후(약 1~2분 뒤) 다시 질문해 주시기 바랍니다."
+        
+        except Exception as e:
+            return f"⚠️ 답변 생성 중 알 수 없는 오류가 발생했습니다: {e}"
 
 # --------------------------------------------------------------------------------
 # 3. Main UI Rendering (이하 내용은 모두 동일)
