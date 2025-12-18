@@ -6,195 +6,208 @@ import time
 from datetime import datetime
 
 # --------------------------------------------------------------------------------
-# 1. Page & Luxury UI Style
+# 1. Page Configuration & Title
 # --------------------------------------------------------------------------------
 st.set_page_config(
     page_title="GIB 정관규정집 AI 상담사",
-    page_icon="🏢",
-    layout="centered"
+    page_icon="🏛️",
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
 
-# 고급스러운 다크 테마 커스텀 CSS
+# Custom CSS for a more professional look
 st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;700&display=swap');
-    
-    html, body, [class*="css"] { font-family: 'Noto Sans KR', sans-serif; }
-    
-    /* 메인 배경 및 카드 스타일 */
-    .main { background-color: #0E1117; }
-    div[data-testid="stExpander"] {
-        border: 1px solid #2d2d2d;
-        border-radius: 15px;
-        background-color: #161b22;
+    /* General Styling */
+    .stApp {
+        font-family: 'Pretendard', sans-serif;
     }
-    
-    /* 고급스러운 타이틀 스타일 */
-    .main-title {
-        font-size: 2.2rem;
-        font-weight: 700;
-        background: linear-gradient(90deg, #FFFFFF, #888888);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.5rem;
+    /* Main container styling */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
     }
-    
-    /* 버튼 애니메이션 */
-    .stButton > button {
+    /* Expander styling */
+    .st-expander {
+        border: 1px solid #333;
         border-radius: 10px;
-        background: linear-gradient(45deg, #2b5876, #4e4376);
-        color: white;
-        border: none;
-        transition: all 0.3s ease;
-        height: 3.5rem;
-        font-size: 1.1rem;
     }
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-    }
-    
-    /* 탭 스타일 */
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #1f2937;
-        border-radius: 8px 8px 0 0;
-        padding: 10px 20px;
-        color: #9ca3af;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #3b82f6 !important;
-        color: white !important;
+    /* Chat message styling */
+    .st-chat-message {
+        background-color: #2b2b2b;
+        border-radius: 10px;
+        padding: 1rem;
+        margin-bottom: 1rem;
     }
     </style>
 """, unsafe_allow_html=True)
 
-# --------------------------------------------------------------------------------
-# 2. API & Model Setup (Error Handling)
-# --------------------------------------------------------------------------------
-def setup_genai():
-    api_key = st.secrets.get("GOOGLE_API_KEY")
-    if api_key:
-        genai.configure(api_key=api_key)
-        return True
-    return False
 
 # --------------------------------------------------------------------------------
-# 3. Core Logic (PDF & AI)
+# 2. Session State Initialization (핵심: 상태 유지)
 # --------------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_and_process_pdf(file_source):
-    """PDF를 읽어 페이지별로 텍스트를 구조화합니다."""
+# 앱이 재실행되어도 유지될 변수들을 session_state에 초기화합니다.
+if "pdf_text" not in st.session_state:
+    st.session_state.pdf_text = ""
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "api_key_configured" not in st.session_state:
+    st.session_state.api_key_configured = False
+
+
+# --------------------------------------------------------------------------------
+# 3. Helper Functions
+# --------------------------------------------------------------------------------
+def configure_genai(api_key):
+    """API 키 설정 및 모델 목록 로드"""
     try:
-        reader = pypdf.PdfReader(file_source)
-        full_text = []
-        progress_text = "📖 규정 전문 분석 중..."
-        bar = st.progress(0, text=progress_text)
-        
-        for i, page in enumerate(reader.pages):
+        genai.configure(api_key=api_key)
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        models.sort(key=lambda x: ('flash' not in x, 'pro' not in x)) # flash, pro 우선 정렬
+        st.session_state.api_key_configured = True
+        return models
+    except Exception as e:
+        st.error(f"API 키 설정에 실패했습니다: {e}")
+        st.session_state.api_key_configured = False
+        return []
+
+@st.cache_data(show_spinner=False)
+def extract_text_from_pdf(file_content):
+    """PDF 파일에서 텍스트 추출 (진행률 표시 포함)"""
+    try:
+        pdf_reader = pypdf.PdfReader(file_content)
+        total_pages = len(pdf_reader.pages)
+        text_data = []
+        progress_bar = st.progress(0, text="규정집 분석 시작...")
+        start_time = time.time()
+
+        for i, page in enumerate(pdf_reader.pages):
             text = page.extract_text()
             if text:
-                full_text.append(f"[문서 페이지: {i+1}]\n{text}")
+                text_data.append(f"--- [Page {i+1}] ---\n{text}")
             
-            # 진행률 표시
-            pct = (i + 1) / len(reader.pages)
-            bar.progress(pct, text=f"{progress_text} ({i+1}/{len(reader.pages)}p)")
+            elapsed_time = time.time() - start_time
+            avg_time_per_page = elapsed_time / (i + 1)
+            remaining_pages = total_pages - (i + 1)
+            estimated_time_left = max(0, avg_time_per_page * remaining_pages)
+            
+            percent_complete = (i + 1) / total_pages
+            status_text = f"⏳ 규정집 분석 중... {i+1}/{total_pages} 페이지 (약 {int(estimated_time_left)}초 남음)"
+            progress_bar.progress(percent_complete, text=status_text)
         
-        time.sleep(0.5)
-        bar.empty()
-        return "\n\n".join(full_text)
+        progress_bar.empty()
+        return "\n\n".join(text_data)
     except Exception as e:
-        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
-        return None
+        st.error(f"PDF 처리 중 오류가 발생했습니다: {e}")
+        return ""
 
-def ask_gemini(model_name, prompt):
-    """429 에러 방지를 위한 재시도 로직이 포함된 질의 함수"""
-    model = genai.GenerativeModel(model_name)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            if "429" in str(e) and attempt < max_retries - 1:
-                time.sleep(2 * (attempt + 1)) # 지수 백오프 (점점 더 오래 대기)
-                continue
-            return f"❌ 오류 발생: {str(e)}"
+def generate_response(model, query, pdf_text, temperature):
+    """Gemini 모델을 통해 답변 생성"""
+    system_prompt = f"""
+    당신은 'GIB' 기관의 정관 및 규정 전문 AI 상담사입니다. 아래 [규정집 내용]을 바탕으로 사용자의 질문에 답변해야 합니다.
+
+    [규정집 내용]
+    {pdf_text}
+
+    [답변 작성 5대 원칙]
+    1. **근거 제시**: 답변의 핵심 내용마다 반드시 관련 근거가 되는 조항과 '페이지 번호(Page X)'를 명확히 인용하세요.
+    2. **정확성**: [규정집 내용]에 없는 정보는 절대 지어내지 마세요. 정보가 없다면 "규정집 원문에서 해당 정보를 찾을 수 없습니다."라고 명확히 답변하세요.
+    3. **가독성**: 복잡한 절차나 여러 항목은 번호 매기기(1., 2., 3.)나 글머리 기호(•)를 사용하여 명료하게 정리하세요.
+    4. **친절한 안내자 톤**: 항상 전문가적이면서도 친절한 어조를 유지하세요.
+    5. **마무리 문구**: 답변의 맨 마지막에는 반드시 다음 문구를 추가하세요: "세부 내용은 정관규정집 원문을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"
+    """
+    try:
+        model = genai.GenerativeModel(model)
+        response = model.generate_content(
+            [system_prompt, f"사용자 질문: {query}"],
+            generation_config={"temperature": temperature}
+        )
+        return response.text
+    except Exception as e:
+        return f"⚠️ 답변 생성 중 오류가 발생했습니다: {str(e)}"
 
 # --------------------------------------------------------------------------------
-# 4. App Body
+# 4. Main UI Rendering
 # --------------------------------------------------------------------------------
-def main():
-    # 헤더 섹션
-    st.markdown('<p class="main-title">🏢 GIB 정관규정집 AI 상담사</p>', unsafe_allow_html=True)
-    st.markdown(f"<p style='color:#888;'>최종 업데이트: {datetime.now().strftime('%Y-%m-%d')}</p>", unsafe_allow_html=True)
+st.title("🏛️ GIB 정관규정집 AI 상담사")
+st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')}")
 
-    # 1단계: API 체크
-    if not setup_genai():
-        st.error("API Key가 설정되지 않았습니다. Secrets를 확인해 주세요.")
-        st.stop()
-
-    # 2단계: 파일 로드 (서버 내 파일 우선)
-    pdf_context = ""
-    default_path = "regulations.pdf"
+# --- 설정 Expander ---
+with st.expander("⚙️ 초기 설정 (API Key & 규정집)", expanded=not st.session_state.api_key_configured or not st.session_state.pdf_text):
+    # API Key 입력
+    api_key_input = st.text_input("Google Gemini API Key", type="password", value=st.secrets.get("GOOGLE_API_KEY", ""))
     
-    with st.expander("🛠️ 시스템 설정 및 데이터 관리", expanded=False):
-        uploaded_file = st.file_uploader("새 규정집 업로드 (선택사항)", type="pdf")
-        selected_model = st.selectbox("엔진 선택", ["gemini-1.5-flash", "gemini-1.5-pro"])
-        temp_val = st.slider("답변 정확도 조정", 0.0, 1.0, 0.0)
+    if api_key_input:
+        available_models = configure_genai(api_key_input)
+    else:
+        st.warning("Google Gemini API 키를 입력해주세요.")
+        available_models = []
 
-    # 데이터 로딩 로직
-    if uploaded_file:
-        pdf_context = load_and_process_pdf(uploaded_file)
-    elif os.path.exists(default_path):
-        with open(default_path, "rb") as f:
-            pdf_context = load_and_process_pdf(f)
+    if st.session_state.api_key_configured:
+        st.success("API Key가 성공적으로 설정되었습니다.")
+        
+        # 모델 선택
+        selected_model = st.selectbox("🤖 답변 생성 모델 선택", available_models)
+        
+        # 파일 업로드
+        uploaded_file = st.file_uploader("규정집 PDF 파일 업로드", type="pdf")
+        if uploaded_file:
+            st.session_state.pdf_text = extract_text_from_pdf(uploaded_file)
+            if st.session_state.pdf_text:
+                st.success(f"✅ '{uploaded_file.name}' 분석 완료! 이제 질문을 시작할 수 있습니다.")
+
+
+# --- 메인 로직: 설정이 완료되었을 때만 표시 ---
+if st.session_state.api_key_configured and st.session_state.pdf_text:
     
-    if not pdf_context:
-        st.info("💡 규정집 파일(regulations.pdf)을 업로드하거나 루트 폴더에 넣어주세요.")
-        st.stop()
-
-    # 3단계: 질문 섹션
+    # 카테고리별 예시 질문 (UX 개선)
     st.markdown("---")
-    query = st.text_input("📝 규정집 내용 중 궁금하신 사항을 입력하세요", placeholder="예: 연가 일수 산정 방식은 어떻게 되나요?")
+    st.subheader("💡 자주 묻는 질문 카테고리")
+    cols = st.columns(3)
+    example_questions = {
+        "휴가/휴직": "연차 사용 규정과 병가 신청 절차를 알려줘.",
+        "출장/경비": "국내 출장 시 교통비와 숙박비 정산 기준이 어떻게 돼?",
+        "인사/평가": "승진 심사 기준과 평가 절차에 대해 설명해줘."
+    }
+    
+    # 각 버튼에 고유한 key를 부여
+    if cols[0].button("🌴 휴가/휴직", use_container_width=True, key="cat_vacation"):
+        st.session_state.preset_query = example_questions["휴가/휴직"]
+    if cols[1].button("✈️ 출장/경비", use_container_width=True, key="cat_biztrip"):
+        st.session_state.preset_query = example_questions["출장/경비"]
+    if cols[2].button("📈 인사/평가", use_container_width=True, key="cat_hr"):
+        st.session_state.preset_query = example_questions["인사/평가"]
+    
+    # 채팅 기록 표시
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    if st.button("전문가에게 문의하기", use_container_width=True):
-        if not query:
-            st.warning("질문을 입력해 주세요.")
-        else:
-            with st.status("🔍 관련 규정을 검색하고 답변을 생성 중입니다...", expanded=True) as status:
-                full_prompt = f"""
-                당신은 GIB(기관명)의 규정 관리 전문 상담사입니다. 
-                제공된 [규정 전문]만을 근거로 사용자의 질문에 답변하세요.
+    # 사용자 질문 입력
+    if prompt := st.chat_input("규정집에 대해 무엇이든 물어보세요.", key="chat_input"):
+        # 사용자가 선택한 예시 질문이 있다면, 그것을 사용
+        if "preset_query" in st.session_state and st.session_state.preset_query:
+            prompt = st.session_state.preset_query
+            del st.session_state.preset_query # 사용 후 삭제
 
-                [규정 전문]
-                {pdf_context}
+        # 사용자 질문을 채팅 기록에 추가하고 화면에 표시
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-                [필수 지침]
-                1. 답변 어조: 공공기관 상담원처럼 매우 정중하고 친절하게 답변하세요.
-                2. 근거 제시: 답변의 각 단락 끝에 반드시 관련 규정 명칭과 [문서 페이지: n]을 명시하세요.
-                3. 형식: 가독성을 위해 불렛 포인트나 번호 매기기를 활용하세요.
-                4. 부재 정보: 만약 [규정 전문]에 내용이 없다면 반드시 "첨부된 자료에는 관련 정보가 없습니다."라고 답하세요.
-                5. 유사 사례: 공무원 규정 등 유사 사례 인용 시 [출처: 공무원 인사규정 등]을 명확히 하세요.
-                6. 마무리 문구: 반드시 "세부내용은 정관규정집을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"로 끝내세요.
+        # AI 답변 생성 및 표시
+        with st.chat_message("assistant"):
+            with st.spinner("답변을 생성하고 있습니다..."):
+                response = generate_response(
+                    model=selected_model,
+                    query=prompt,
+                    pdf_text=st.session_state.pdf_text,
+                    temperature=0.1  # 사실 기반 답변을 위해 낮은 온도로 설정
+                )
+                st.markdown(response)
+        
+        # AI 답변을 채팅 기록에 추가
+        st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-                사용자 질문: {query}
-                """
-                
-                answer = ask_gemini(selected_model, full_prompt)
-                status.update(label="✅ 분석 완료", state="complete", expanded=False)
-
-            # 결과 대시보드
-            tab1, tab2 = st.tabs(["💬 규정 답변", "📄 참고 데이터"])
-            with tab1:
-                st.markdown(f"""
-                <div style="background-color: #1e293b; padding: 20px; border-radius: 10px; border-left: 5px solid #3b82f6;">
-                    {answer}
-                </div>
-                """, unsafe_allow_html=True)
-            with tab2:
-                st.caption("AI가 참조한 원문 데이터의 일부입니다.")
-                st.text_area("Original Text Context", pdf_context[:5000], height=300)
-
-if __name__ == "__main__":
-    main()
+else:
+    st.info("👆 상단의 '초기 설정'을 열어 API Key를 입력하고 규정집 PDF 파일을 업로드해주세요.")
