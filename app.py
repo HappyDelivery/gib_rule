@@ -1,7 +1,7 @@
 import streamlit as st
 import google.generativeai as genai
-import pypdf
 import os
+import time
 
 # 1. 페이지 설정 및 디자인
 st.set_page_config(page_title="GIB 정관규정집 AI 상담사", page_icon="🏢", layout="centered")
@@ -9,80 +9,61 @@ st.set_page_config(page_title="GIB 정관규정집 AI 상담사", page_icon="�
 st.markdown("""
     <style>
     .stApp { font-family: 'Pretendard', sans-serif; }
-    .stButton > button { width: 100%; border-radius: 8px; height: 3.5em; font-weight: bold; background-color: #FF4B4B; color: white; }
-    /* 질문 입력창 스타일 */
+    .stButton > button { width: 100%; border-radius: 8px; height: 3.5em; font-weight: bold; background-color: #FF4B4B; color: white; border: none; }
     div[data-baseweb="textarea"] { border-radius: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
-# 2. PDF 텍스트 추출 함수 (최적화)
-def extract_text_from_pdf(file_path):
-    if not os.path.exists(file_path):
-        return None, "파일을 찾을 수 없습니다."
-    
+# 2. Gemini 파일 API를 이용한 업로드 및 캐싱 (속도 핵심)
+@st.cache_resource
+def upload_to_gemini(file_path):
+    """파일을 구글 서버에 업로드하고 식별자를 반환 (딱 한 번만 실행됨)"""
     try:
-        with open(file_path, "rb") as f:
-            pdf_reader = pypdf.PdfReader(f)
-            total_pages = len(pdf_reader.pages)
-            text_data = []
+        # 파일 업로드
+        uploaded_file = genai.upload_file(path=file_path, display_name="GIB_Regulations")
+        
+        # 업로드된 파일이 처리될 때까지 대기 (보통 수 초 소요)
+        while uploaded_file.state.name == "PROCESSING":
+            time.sleep(1)
+            uploaded_file = genai.get_file(uploaded_file.name)
             
-            # 진행 상태 표시를 위해 텍스트 추출 시각화
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        if uploaded_file.state.name == "FAILED":
+            raise Exception("구글 서버 내 파일 처리 실패")
             
-            for i in range(total_pages):
-                page = pdf_reader.pages[i]
-                content = page.extract_text()
-                if content:
-                    text_data.append(f"--- [Page {i+1}] ---\n{content}")
-                
-                # 진행률 업데이트 (매 10페이지마다)
-                if i % 10 == 0 or i == total_pages - 1:
-                    progress = (i + 1) / total_pages
-                    progress_bar.progress(progress)
-                    status_text.text(f"📄 규정집 분석 중... ({i+1}/{total_pages} 페이지)")
-            
-            progress_bar.empty()
-            status_text.empty()
-            
-            full_text = "\n\n".join(text_data)
-            if len(full_text.strip()) < 100:
-                return None, "글자를 읽을 수 없는 PDF입니다. (이미지 스캔본 여부 확인 필요)"
-            
-            return full_text, "OK"
+        return uploaded_file
     except Exception as e:
-        return None, f"오류 발생: {str(e)}"
+        st.error(f"파일 업로드 중 오류: {e}")
+        return None
 
-# 3. 메인 로직
 def main():
     st.title("🏢 GIB 정관규정집 AI 상담사")
 
     # API 설정
     api_key = st.secrets.get("GOOGLE_API_KEY")
     if not api_key:
-        st.error("🔑 API Key가 설정되지 않았습니다.")
+        st.error("🔑 API Key 설정이 필요합니다.")
         return
     genai.configure(api_key=api_key)
 
-    # 4. 파일 로딩 (세션 상태 활용하여 1회만 실행)
-    if "pdf_content" not in st.session_state:
-        file_path = "regulations.pdf"
-        with st.spinner("🚀 규정집 데이터를 초기화하고 있습니다. 잠시만 기다려 주세요..."):
-            content, msg = extract_text_from_pdf(file_path)
-            if content:
-                st.session_state.pdf_content = content
-                st.success("✅ 규정집 분석이 완료되었습니다!")
-            else:
-                st.error(f"❌ {msg}")
-                st.info("Tip: GitHub에 'regulations.pdf' 파일이 있고 글자가 드래그 가능한 파일인지 확인해 주세요.")
-                return
-    
-    # 5. 상담 카테고리 및 질문 화면
+    # 3. 파일 존재 확인 및 구글 서버 업로드
+    file_path = "regulations.pdf"
+    if not os.path.exists(file_path):
+        st.error(f"❌ '{file_path}' 파일을 찾을 수 없습니다.")
+        return
+
+    # 구글 서버에 업로드 (캐싱 처리되어 앱 실행 시 한 번만 수행됨)
+    with st.spinner("🚀 시스템을 초기화 중입니다 (최초 1회)..."):
+        gemini_file = upload_to_gemini(file_path)
+
+    if not gemini_file:
+        return
+
+    # 4. 상담 화면 UI
     st.markdown("### 상담 분야를 선택하세요")
     
     categories = {
         "인사 (승진, 채용, 평가)": "4급 승진을 위한 최저 소요 연수는 몇 년인가요?",
-        "급여 (호봉, 수당, 퇴직금)": "가족수당 지급 기준과 금액이 궁금합니다.",
+        "급여 (호봉, 수당, 퇴직금)": "가족 4명의 경우 수당 지급 기준을 알려주세요.",
         "복무 (휴가, 출장, 근무시간)": "연차 휴가 이월 규정에 대해 알려주세요.",
         "복지 (학자금, 의료비 지원)": "자녀 학자금 보조 수당 신청 절차는 어떻게 되나요?",
         "기타 (징계, 감사 등)": "징계 위원회 구성 요건이 어떻게 되나요?"
@@ -99,31 +80,37 @@ def main():
         if not query:
             st.warning("질문을 입력해 주세요.")
         else:
-            with st.spinner("규정집에서 답변을 찾고 있습니다..."):
+            with st.spinner("규정집을 분석하여 답변을 생성 중입니다..."):
                 try:
+                    # 에러 해결 포인트: 모델명을 가장 안정적인 'gemini-1.5-flash'로 설정
                     model = genai.GenerativeModel('gemini-1.5-flash')
                     
-                    system_prompt = f"""
+                    prompt = f"""
                     당신은 GIB 기관의 정관 및 규정 전문 상담사입니다.
-                    아래 제공된 [규정집 내용]만을 바탕으로 답변하세요.
+                    제공된 규정집 파일 내용을 바탕으로 사용자의 질문에 답변하세요.
 
-                    [규정집 내용]
-                    {st.session_state.pdf_content}
+                    [질문 분야]: {selected_cat}
+                    [사용자 질문]: {query}
 
-                    [작성 규칙]
-                    1. 답변은 친절하고 명확하게 작성하세요.
-                    2. 반드시 관련 근거 규정명과 페이지 번호를 명시하세요.
-                    3. 규정집에 없는 내용은 "첨부된 자료에는 관련 정보가 없습니다."라고 답하세요.
-                    4. 마지막 인사말: "세부내용은 정관규정집을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"
+                    [필수 답변 규칙]
+                    1. 정확하고 사실에 근거하여 친절하게 답변하세요.
+                    2. 반드시 해당 내용의 근거가 되는 규정 명칭과 '페이지 번호'를 명시하세요.
+                    3. 파일 내에 관련 정보가 없는 경우 "첨부된 자료에는 관련 정보가 없습니다."라고 명확히 답변하세요.
+                    4. 복잡한 절차는 번호가 매겨진 리스트 형식으로 정리하세요.
+                    5. 답변 마지막 문구는 반드시 아래 문장으로 끝내세요:
+                       "세부내용은 정관규정집을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"
                     """
                     
-                    response = model.generate_content([system_prompt, f"질문: {query}"])
+                    # 파일 URI를 참조하여 답변 생성 (파일 데이터를 직접 보내지 않아 매우 빠름)
+                    response = model.generate_content([gemini_file, prompt])
                     
                     st.markdown("### 💡 답변 결과")
                     st.info(response.text)
                     
                 except Exception as e:
-                    st.error(f"답변 생성 중 오류가 발생했습니다: {e}")
+                    # 모델 명칭 에러 대응을 위한 대체 시도
+                    st.error(f"답변 생성 중 오류가 발생했습니다. (관리자 문의)")
+                    st.caption(f"상세 에러: {str(e)}")
 
 if __name__ == "__main__":
     main()
