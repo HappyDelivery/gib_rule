@@ -2,6 +2,7 @@ import streamlit as st
 import google.generativeai as genai
 import pypdf
 import os
+import time
 
 # 1. 페이지 설정
 st.set_page_config(page_title="GIB 정관규정집 AI 상담사", page_icon="🏢", layout="centered")
@@ -11,27 +12,11 @@ st.markdown("""
     <style>
     .stApp { font-family: 'Pretendard', sans-serif; }
     .stButton > button { width: 100%; border-radius: 8px; height: 3.5em; font-weight: bold; background-color: #FF4B4B; color: white; border: none; }
-    div[data-baseweb="textarea"] { border-radius: 10px; }
-    .answer-box { background-color: #1E1E1E; padding: 20px; border-radius: 10px; border-left: 5px solid #FF4B4B; }
+    .stProgress .st-bo { background-color: #FF4B4B; }
+    .loading-text { font-size: 0.9em; color: #AAAAAA; margin-bottom: 5px; }
+    .answer-box { background-color: #1E1E1E; padding: 20px; border-radius: 10px; border-left: 5px solid #FF4B4B; line-height: 1.6; }
     </style>
 """, unsafe_allow_html=True)
-
-# 2. PDF 텍스트 추출 및 캐싱 (속도 최적화의 핵심)
-@st.cache_data(show_spinner=False)
-def get_pdf_text(file_path):
-    if not os.path.exists(file_path):
-        return None
-    try:
-        with open(file_path, "rb") as f:
-            pdf_reader = pypdf.PdfReader(f)
-            extracted_pages = []
-            for i, page in enumerate(pdf_reader.pages):
-                text = page.extract_text()
-                if text:
-                    extracted_pages.append(f"[페이지 {i+1}]\n{text}")
-            return "\n\n".join(extracted_pages)
-    except:
-        return None
 
 def main():
     st.title("🏢 GIB 정관규정집 AI 상담사")
@@ -43,21 +28,56 @@ def main():
         return
     genai.configure(api_key=api_key)
 
-    # 3. 데이터 로딩 (캐싱을 사용하여 접속 시 한 번만 실행)
+    # 2. 데이터 로딩 (진행률 표시 로직)
     file_path = "regulations.pdf"
+    
     if "full_text" not in st.session_state:
-        with st.spinner("📄 규정집 데이터를 최적화 중입니다..."):
-            text = get_pdf_text(file_path)
-            if text:
-                st.session_state.full_text = text
-            else:
-                st.error("❌ 'regulations.pdf' 파일을 읽을 수 없습니다. GitHub에 파일이 있는지 확인해 주세요.")
+        if not os.path.exists(file_path):
+            st.error(f"❌ '{file_path}' 파일을 찾을 수 없습니다.")
+            return
+
+        # 진행률 표시용 컨테이너
+        status_container = st.empty()
+        
+        with status_container.container():
+            st.markdown('<p class="loading-text">📄 규정집 데이터를 최적화 중입니다. 잠시만 기다려 주세요...</p>', unsafe_allow_html=True)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            try:
+                start_time = time.time()
+                with open(file_path, "rb") as f:
+                    pdf_reader = pypdf.PdfReader(f)
+                    total_pages = len(pdf_reader.pages)
+                    extracted_pages = []
+                    
+                    for i in range(total_pages):
+                        # 페이지 텍스트 추출
+                        page = pdf_reader.pages[i]
+                        text = page.extract_text()
+                        if text:
+                            extracted_pages.append(f"[페이지 {i+1}]\n{text}")
+                        
+                        # 실시간 진행률 업데이트
+                        percent = int(((i + 1) / total_pages) * 100)
+                        elapsed_time = int(time.time() - start_time)
+                        progress_bar.progress(percent)
+                        status_text.markdown(f"**진행도:** {percent}% ({i+1}/{total_pages} 페이지) | **경과 시간:** {elapsed_time}초")
+                
+                st.session_state.full_text = "\n\n".join(extracted_pages)
+                status_container.empty() # 로딩 완료 시 UI 제거
+                st.success(f"✅ 분석 완료! ({total_pages} 페이지, {elapsed_time}초 소요)")
+                time.sleep(1) # 메시지를 잠시 보여줌
+                st.rerun() # 화면 새로고침하여 본 화면 진입
+                
+            except Exception as e:
+                st.error(f"❌ PDF 읽기 오류: {e}")
                 return
 
-    # 4. 상담 UI 구성
+    # 3. 본 화면 (상담 UI)
     st.markdown("### 상담 분야를 선택하세요")
     categories = {
-        "인사 (승진, 채용, 평가)": "4급 승진을 위한 최저 소요 연수는 몇 년인가요?",
+        "인사 (승진, 채용, 평가)": "선임급 승진을 위한 최저 소요 연수는 몇 년인가요?",
         "급여 (호봉, 수당, 퇴직금)": "가족 4명의 경우 수당 지급 기준을 알려주세요.",
         "복무 (휴가, 출장, 근무시간)": "연차 휴가 이월 규정에 대해 알려주세요.",
         "복지 (학자금, 의료비 지원)": "자녀 학자금 보조 수당 신청 절차는 어떻게 되나요?",
@@ -75,9 +95,9 @@ def main():
         if not query:
             st.warning("질문을 입력해 주세요.")
         else:
-            with st.spinner("규정집을 분석하여 답변을 작성 중입니다..."):
+            with st.spinner("규정집 내용을 확인하여 답변을 생성하고 있습니다..."):
                 try:
-                    # [에러 해결] 가장 안정적인 모델 호출 방식
+                    # [404 에러 방지용 모델 리스트]
                     model = genai.GenerativeModel('gemini-1.5-flash')
                     
                     prompt = f"""
@@ -105,15 +125,8 @@ def main():
                     st.markdown(f'<div class="answer-box">{response.text}</div>', unsafe_allow_html=True)
                     
                 except Exception as e:
-                    # 만약의 경우를 대비한 모델명 우회 로직
-                    try:
-                        model = genai.GenerativeModel('gemini-1.5-flash-latest')
-                        response = model.generate_content(prompt)
-                        st.markdown("### 💡 답변 결과")
-                        st.markdown(f'<div class="answer-box">{response.text}</div>', unsafe_allow_html=True)
-                    except:
-                        st.error("⚠️ AI 서비스와 연결이 원활하지 않습니다. 잠시 후 다시 시도해 주세요.")
-                        st.caption(f"Error Detail: {e}")
+                    st.error("⚠️ AI 서비스 응답 오류가 발생했습니다.")
+                    st.caption(f"Error Detail: {e}")
 
 if __name__ == "__main__":
     main()
