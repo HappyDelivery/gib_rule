@@ -7,7 +7,7 @@ from datetime import datetime
 from google.api_core.exceptions import ResourceExhausted
 
 # --------------------------------------------------------------------------------
-# 1. Page Configuration & Style
+# 1. 환경 설정 및 스타일
 # --------------------------------------------------------------------------------
 st.set_page_config(
     page_title="GIB 정관규정집 AI 상담사",
@@ -19,151 +19,196 @@ st.markdown("""
     <style>
     .stApp { font-family: 'Pretendard', sans-serif; }
     .stButton>button { border-radius: 8px; font-weight: bold; }
+    /* 답변 영역 스타일 */
+    .st-emotion-cache-1v0mbdj { border-radius: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
 # --------------------------------------------------------------------------------
-# 2. State Management & Backend Functions
+# 2. 백엔드 로직 (모델 다중화 & 스마트 검색)
 # --------------------------------------------------------------------------------
+
+# 세션 상태 초기화
 if "data_loaded" not in st.session_state:
     st.session_state.data_loaded = False
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "pdf_pages" not in st.session_state:
+    st.session_state.pdf_pages = [] # 페이지별 분할 저장
 
-def load_data_and_model():
-    # ... (이전 코드와 동일)
+def get_relevant_context(query, pages, top_k=5):
+    """
+    [핵심 기능] PDF 전체를 다 보내지 않고, 질문과 관련된 페이지만 찾아서 보냄 (토큰 절약)
+    - 단순 키워드 매칭 방식 사용 (속도 빠름, 토큰 절약 최적화)
+    """
+    query_keywords = query.split()
+    scored_pages = []
+    
+    for i, page_text in enumerate(pages):
+        score = 0
+        for keyword in query_keywords:
+            if keyword in page_text:
+                score += 1
+        if score > 0:
+            scored_pages.append((score, page_text))
+    
+    # 관련도 순 정렬 후 상위 k개 페이지 추출
+    scored_pages.sort(key=lambda x: x[0], reverse=True)
+    selected_pages = [p[1] for p in scored_pages[:top_k]]
+    
+    # 만약 검색 결과가 없으면(키워드 불일치), 앞부분 3페이지만 보냄 (서론/목차 등)
+    if not selected_pages:
+        return "\n\n".join(pages[:3])
+    
+    return "\n\n".join(selected_pages)
+
+def load_data_and_models():
+    """앱 초기화: API 설정 및 PDF 로드"""
+    # 1. API 설정 및 사용 가능한 모델 리스트 확보
     try:
         api_key = st.secrets["GOOGLE_API_KEY"]
         genai.configure(api_key=api_key)
-        model_list = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        st.session_state.model = next((m for m in model_list if 'flash' in m), model_list[0])
+        
+        # 사용 가능한 모델을 모두 가져와서 Flash -> Pro 순서로 정렬 (Flash가 싸고 빠름)
+        all_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        # 우선순위: Flash > Pro > 나머지
+        sorted_models = sorted(all_models, key=lambda x: (0 if 'flash' in x else 1 if 'pro' in x else 2))
+        st.session_state.available_models = sorted_models
+        
     except Exception as e:
-        st.error(f"API 키 설정 중 오류가 발생했습니다: {e}", icon="🚨")
+        st.error(f"API 설정 오류: {e}")
         st.stop()
+
+    # 2. PDF 로드 (페이지별로 리스트에 저장)
     file_path = "regulations.pdf"
     if not os.path.exists(file_path):
-        st.error(f"'{file_path}' 파일을 찾을 수 없습니다. GitHub 저장소에 파일이 있는지 확인하세요.", icon="📂")
+        st.error(f"파일 없음: {file_path}")
         st.stop()
+    
     try:
-        with open(file_path, "rb") as f, st.spinner():
+        with open(file_path, "rb") as f, st.spinner("규정집 분석 중..."):
             pdf_reader = pypdf.PdfReader(f)
-            total_pages = len(pdf_reader.pages)
-            text_data = []
-            progress_bar = st.progress(0, text="규정집 분석 시작...")
-            start_time = time.time()
+            st.session_state.pdf_pages = []
+            
+            # 진행바
+            progress = st.progress(0, "페이지 분석 중...")
+            total = len(pdf_reader.pages)
+            
             for i, page in enumerate(pdf_reader.pages):
                 text = page.extract_text()
                 if text:
-                    text_data.append(f"--- [Page {i+1}] ---\n{text}")
-                elapsed = time.time() - start_time
-                avg_time_per_page = elapsed / (i + 1)
-                remaining_pages = total_pages - (i + 1)
-                eta = max(0, avg_time_per_page * remaining_pages)
-                percent_complete = (i + 1) / total_pages
-                status_text = f"규정집 분석 중... {i+1}/{total_pages} 페이지 (예상 남은 시간: {int(eta)}초)"
-                progress_bar.progress(percent_complete, text=status_text)
-            st.session_state.pdf_text = "\n\n".join(text_data)
-            progress_bar.empty()
+                    # 페이지 번호 마킹하여 저장
+                    st.session_state.pdf_pages.append(f"--- [Page {i+1}] ---\n{text}")
+                progress.progress((i+1)/total)
+            
+            progress.empty()
+            
     except Exception as e:
-        st.error(f"PDF 처리 중 오류가 발생했습니다: {e}", icon="📄")
+        st.error(f"PDF 오류: {e}")
         st.stop()
+
     st.session_state.data_loaded = True
 
-
-def generate_response(model, query, pdf_text):
-    """AI 답변 생성 (자동 재시도 로직 포함)"""
+def generate_response_with_fallback(query):
+    """
+    [핵심 기능] 모델 자동 우회 (Fallback) 시스템
+    - 1순위 모델이 실패하면 자동으로 2순위, 3순위 모델로 교체하여 재시도
+    """
     
-    # 시스템 프롬프트 (이전과 동일)
+    # 1. 질문과 관련된 페이지 추출 (토큰 절약)
+    relevant_context = get_relevant_context(query, st.session_state.pdf_pages)
+    
     system_prompt = f"""
-    # **당신의 역할 및 정체성**
-    당신은 오직 주어진 [규정집 원문]의 내용만을 분석하고 답변하는, 고도로 정밀한 '문서 분석 AI'입니다. 당신의 목표는 사용자의 질문에 대해 100% 규정집에 근거한 정확한 정보를 제공하는 것입니다.
+    당신은 '문서 분석 AI'입니다. 아래 제공된 [관련 규정 내용]을 기반으로 질문에 답하세요.
 
-    # **규칙 (반드시 지켜야 할 철칙)**
-    1. **정보 출처 제한**: 당신은 오직 아래 제공된 [규정집 원문] 정보만을 사용해야 합니다. 당신이 학습한 다른 어떤 외부 지식, 웹 정보, 개인적인 추론도 절대 사용해서는 안 됩니다. 이것이 가장 중요한 제1원칙입니다.
-    2. **근거 명시 의무**: 모든 답변에는 반드시 정보의 출처인 '페이지 번호(Page X)'를 명시해야 합니다. 예를 들어, "해당 내용은 규정집 15페이지에서 확인할 수 있습니다." 와 같이 구체적으로 제시해야 합니다.
-    3. **없는 정보 처리**: 만약 사용자의 질문에 대한 내용이 [규정집 원문]에 없다면, 절대 답변을 지어내지 마세요. 대신, 반드시 아래와 같이 정해진 문구로만 답변해야 합니다.
-       > "규정집 원문에서 해당 정보를 찾을 수 없습니다. 질문을 조금 더 구체적으로 해주시거나 다른 키워드를 사용해 보시는 것을 권장합니다."
-    4. **답변 형식**: 복잡한 절차나 여러 항목은 번호 매기기나 글머리 기호를 사용해 가독성을 높여주세요.
-    5. **마무리 문구**: 모든 답변의 맨 마지막에는 반드시 다음 문구를 추가해야 합니다.
-       > "세부 내용은 정관규정집 원문을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"
+    [관련 규정 내용 (발췌)]
+    {relevant_context}
 
-    # **[규정집 원문]**
-    {pdf_text}
+    [작성 원칙]
+    1. 반드시 제공된 내용에 근거해서만 답하세요. 외부 정보 사용 금지.
+    2. 답변에는 '페이지 번호'를 꼭 명시하세요. (예: Page 12)
+    3. 정보가 없으면 "제공된 규정 내용에서 관련 정보를 찾을 수 없습니다."라고 답하세요.
+    4. 마지막 문구: "세부 내용은 정관규정집 원문을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"
     """
 
-    # === [자동 재시도 로직 추가] ===
-    max_retries = 3  # 최대 3번까지 재시도
-    retry_delay = 5  # 첫 대기 시간 5초
+    # 2. 모델 리스트를 순회하며 시도 (Fallback)
+    models = st.session_state.get("available_models", [])
+    if not models:
+        return "사용 가능한 AI 모델을 찾을 수 없습니다."
 
-    for attempt in range(max_retries):
+    last_error = ""
+    
+    for model_name in models:
         try:
-            # 모델 생성
-            ai_model = genai.GenerativeModel(model)
+            # 모델 변경 시도 알림 (로그 성격, 화면엔 표시 X)
+            # print(f"Trying model: {model_name}") 
             
-            # 답변 요청
+            ai_model = genai.GenerativeModel(model_name)
             response = ai_model.generate_content(
-                [system_prompt, f"사용자 질문: {query}"], 
+                [system_prompt, f"사용자 질문: {query}"],
                 generation_config={"temperature": 0.0}
             )
-            return response.text
-
+            return response.text # 성공 시 바로 반환
+            
         except ResourceExhausted:
-            # API 한도 초과 에러 발생 시
-            if attempt < max_retries - 1:
-                wait_time = retry_delay * (attempt + 1) # 5초, 10초, 15초... 점진적으로 대기
-                time.sleep(wait_time) # 코드 실행을 잠시 멈춤
-                continue # 다시 시도 루프로 돌아감
-            else:
-                # 3번 다 실패했을 경우
-                return "⚠️ **사용량이 많아 답변이 지연되고 있습니다.**\n\n현재 무료 API의 한도를 초과했습니다. 잠시 후(약 1~2분 뒤) 다시 질문해 주시기 바랍니다."
-        
+            # 한도 초과 시 다음 모델로 넘어감
+            continue 
         except Exception as e:
-            return f"⚠️ 답변 생성 중 알 수 없는 오류가 발생했습니다: {e}"
+            last_error = str(e)
+            continue
+            
+    # 모든 모델이 실패했을 경우
+    return f"⚠️ 죄송합니다. 모든 AI 모델이 현재 사용량이 많아 응답할 수 없습니다.\n(마지막 오류: {last_error})\n잠시 후 다시 시도해주세요."
 
 # --------------------------------------------------------------------------------
-# 3. Main UI Rendering (이하 내용은 모두 동일)
+# 3. UI 렌더링
 # --------------------------------------------------------------------------------
 st.title("🏛️ GIB 정관규정집 AI 상담사")
 st.caption(f"기준일: {datetime.now().strftime('%Y-%m-%d')}")
 st.divider()
 
+# 데이터 로드
 if not st.session_state.data_loaded:
-    load_data_and_model()
+    load_data_and_models()
     st.rerun()
 
-st.markdown("#### 💬 카테고리별 질문 예시")
+# 카테고리 예시
+st.markdown("#### 💬 자주 묻는 질문")
 example_questions = {
-    "인사/복무": ["연차휴가 사용 규정", "병가 신청 절차와 필요 서류", "육아휴직 신청 자격"],
-    "보수/경비": ["출장비 정산 방법", "시간외근무수당 지급 기준", "경조사비 지급 규정"],
-    "기타": ["법인카드 사용 시 주의사항", "정보보안 관련 규정", "차량 운행 및 관리 규정"],
+    "인사/복무": ["연차휴가 사용 규정", "병가 신청 절차", "육아휴직 자격"],
+    "보수/경비": ["출장비 정산 방법", "시간외수당 기준", "경조사비 지급"],
+    "기타": ["법인카드 사용 규정", "보안 규정", "차량 관리"]
 }
-selected_category = st.selectbox("궁금한 분야를 선택하세요.", list(example_questions.keys()))
+selected_category = st.selectbox("분야 선택", list(example_questions.keys()))
 
 cols = st.columns(len(example_questions[selected_category]))
-for i, question in enumerate(example_questions[selected_category]):
-    if cols[i].button(question, use_container_width=True):
-        st.session_state.user_query = question
+for i, q in enumerate(example_questions[selected_category]):
+    if cols[i].button(q, use_container_width=True):
+        st.session_state.user_query = q
         st.rerun()
 
+# 직접 질문
 st.markdown("---")
 st.markdown("#### ✍️ 직접 질문하기")
-user_query = st.text_area("규정집 내용 중 궁금하신 사항을 입력하세요.", key="user_query", height=120)
+user_query = st.text_area("질문을 입력하세요.", key="user_query", height=100)
 
-if st.button("AI에게 질문하기 🚀", type="primary", use_container_width=True):
+if st.button("답변 받기 🚀", type="primary", use_container_width=True):
     if user_query:
         st.session_state.chat_history.append({"role": "user", "content": user_query})
-        with st.spinner("AI가 규정집을 검토하고 답변을 생성 중입니다..."):
-            response_text = generate_response(st.session_state.model, user_query, st.session_state.pdf_text)
+        
+        with st.spinner("AI 모델을 최적화하여 답변을 생성 중입니다..."):
+            # 개선된 Fallback 함수 호출
+            response_text = generate_response_with_fallback(user_query)
             st.session_state.chat_history.append({"role": "assistant", "content": response_text})
         st.rerun()
     else:
-        st.warning("질문을 입력해주세요.", icon="⚠️")
+        st.warning("질문을 입력해주세요.")
 
+# 결과 표시
 st.markdown("---")
-st.markdown("#### 📋 답변 결과")
-if not st.session_state.chat_history:
-    st.info("질문을 입력하거나 예시 질문을 선택한 후 'AI에게 질문하기' 버튼을 누르세요.")
-else:
+if st.session_state.chat_history:
     for message in reversed(st.session_state.chat_history):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+else:
+    st.info("질문을 입력하면 AI가 규정집을 분석하여 답변합니다.")
