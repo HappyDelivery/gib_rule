@@ -1,20 +1,17 @@
 import streamlit as st
 import google.generativeai as genai
-import pypdf
 import os
 import time
 
 # 1. 페이지 설정
 st.set_page_config(page_title="GIB 정관규정집 AI 상담사", page_icon="🏢", layout="centered")
 
-# 디자인 개선 (CSS)
+# 디자인 최적화 (모바일 우선)
 st.markdown("""
     <style>
     .stApp { font-family: 'Pretendard', sans-serif; }
-    .stButton > button { width: 100%; border-radius: 8px; height: 3.5em; font-weight: bold; background-color: #FF4B4B; color: white; border: none; }
-    .stProgress .st-bo { background-color: #FF4B4B; }
-    .loading-text { font-size: 0.9em; color: #AAAAAA; margin-bottom: 5px; }
-    .answer-box { background-color: #1E1E1E; padding: 20px; border-radius: 10px; border-left: 5px solid #FF4B4B; line-height: 1.6; }
+    .stButton > button { width: 100%; border-radius: 12px; height: 3.5em; font-weight: bold; background-color: #FF4B4B; color: white; border: none; }
+    .status-box { padding: 15px; border-radius: 10px; background-color: #262730; border: 1px solid #464646; margin-bottom: 20px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -24,60 +21,48 @@ def main():
     # API 설정
     api_key = st.secrets.get("GOOGLE_API_KEY")
     if not api_key:
-        st.error("🔑 API Key를 찾을 수 없습니다. Streamlit Cloud의 Secrets 설정을 확인하세요.")
+        st.error("🔑 API Key를 찾을 수 없습니다. Secrets 설정을 확인하세요.")
         return
     genai.configure(api_key=api_key)
 
-    # 2. 데이터 로딩 (진행률 표시 로직)
     file_path = "regulations.pdf"
     
-    if "full_text" not in st.session_state:
+    # 2. Gemini File API를 활용한 파일 분석 (메모리 절약형)
+    if "gemini_file_uri" not in st.session_state:
         if not os.path.exists(file_path):
-            st.error(f"❌ '{file_path}' 파일을 찾을 수 없습니다.")
+            st.error(f"❌ '{file_path}' 파일이 GitHub에 없습니다.")
             return
 
-        # 진행률 표시용 컨테이너
-        status_container = st.empty()
-        
-        with status_container.container():
-            st.markdown('<p class="loading-text">📄 규정집 데이터를 최적화 중입니다. 잠시만 기다려 주세요...</p>', unsafe_allow_html=True)
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
+        with st.status("🚀 규정집을 AI 서버에 연결하는 중...", expanded=True) as status:
             try:
-                start_time = time.time()
-                with open(file_path, "rb") as f:
-                    pdf_reader = pypdf.PdfReader(f)
-                    total_pages = len(pdf_reader.pages)
-                    extracted_pages = []
-                    
-                    for i in range(total_pages):
-                        # 페이지 텍스트 추출
-                        page = pdf_reader.pages[i]
-                        text = page.extract_text()
-                        if text:
-                            extracted_pages.append(f"[페이지 {i+1}]\n{text}")
-                        
-                        # 실시간 진행률 업데이트
-                        percent = int(((i + 1) / total_pages) * 100)
-                        elapsed_time = int(time.time() - start_time)
-                        progress_bar.progress(percent)
-                        status_text.markdown(f"**진행도:** {percent}% ({i+1}/{total_pages} 페이지) | **경과 시간:** {elapsed_time}초")
+                # 파일을 구글 서버로 직접 업로드 (로컬 메모리 사용 최소화)
+                st.write("1. 파일 전송 중...")
+                uploaded_file = genai.upload_file(path=file_path)
                 
-                st.session_state.full_text = "\n\n".join(extracted_pages)
-                status_container.empty() # 로딩 완료 시 UI 제거
-                st.success(f"✅ 분석 완료! ({total_pages} 페이지, {elapsed_time}초 소요)")
-                time.sleep(1) # 메시지를 잠시 보여줌
-                st.rerun() # 화면 새로고침하여 본 화면 진입
+                st.write("2. AI가 문서를 분석 중입니다 (수 초 소요)...")
+                # 파일 처리 대기
+                while uploaded_file.state.name == "PROCESSING":
+                    time.sleep(2)
+                    uploaded_file = genai.get_file(uploaded_file.name)
+                
+                if uploaded_file.state.name == "FAILED":
+                    st.error("AI 서버 내 파일 분석에 실패했습니다.")
+                    return
+                
+                # 업로드된 파일 정보 저장
+                st.session_state.gemini_file_uri = uploaded_file.uri
+                st.session_state.gemini_file_name = uploaded_file.name
+                status.update(label="✅ 분석 준비 완료!", state="complete", expanded=False)
                 
             except Exception as e:
-                st.error(f"❌ PDF 읽기 오류: {e}")
+                st.error(f"❌ 분석 중 오류 발생: {e}")
+                st.info("Tip: 파일명이 정확한지, API 키가 유효한지 확인하세요.")
                 return
 
-    # 3. 본 화면 (상담 UI)
+    # 3. 상담 UI (본 화면)
     st.markdown("### 상담 분야를 선택하세요")
     categories = {
-        "인사 (승진, 채용, 평가)": "선임급 승진을 위한 최저 소요 연수는 몇 년인가요?",
+        "인사 (승진, 채용, 평가)": "4급 승진을 위한 최저 소요 연수는 몇 년인가요?",
         "급여 (호봉, 수당, 퇴직금)": "가족 4명의 경우 수당 지급 기준을 알려주세요.",
         "복무 (휴가, 출장, 근무시간)": "연차 휴가 이월 규정에 대해 알려주세요.",
         "복지 (학자금, 의료비 지원)": "자녀 학자금 보조 수당 신청 절차는 어떻게 되나요?",
@@ -95,38 +80,40 @@ def main():
         if not query:
             st.warning("질문을 입력해 주세요.")
         else:
-            with st.spinner("규정집 내용을 확인하여 답변을 생성하고 있습니다..."):
+            with st.spinner("AI 상담사가 답변을 작성하고 있습니다..."):
                 try:
-                    # [404 에러 방지용 모델 리스트]
+                    # 404 에러 방지용: 모델 식별자 최적화
                     model = genai.GenerativeModel('gemini-1.5-flash')
+                    
+                    # 파일 참조 정보 가져오기
+                    doc_ref = genai.get_file(st.session_state.gemini_file_name)
                     
                     prompt = f"""
                     당신은 GIB 기관의 정관 및 규정 전문 상담사입니다. 
-                    아래 [규정집 내용]을 바탕으로만 답변하세요.
-
-                    [규정집 내용]
-                    {st.session_state.full_text}
+                    첨부된 규정집 파일을 정독하고, 오직 그 내용에만 근거하여 답변하세요.
 
                     [상담 분야]: {selected_cat}
                     [사용자 질문]: {query}
 
                     [작성 규칙]
-                    1. 정확하고 사실에 근거하여 친절한 말투로 답변하세요.
-                    2. 답변 내용에 해당하는 관련 규정 명칭과 해당 [페이지 번호]를 반드시 명시하세요.
-                    3. 만약 규정집 내용에 질문과 관련된 정보가 없다면 반드시 "첨부된 자료에는 관련 정보가 없습니다."라고 답변하세요.
-                    4. 복잡한 절차나 조건은 번호가 매겨진 리스트 형태로 정리하세요.
-                    5. 답변 마지막 문구는 반드시 다음 내용을 포함하세요:
-                       "세부내용은 정관규정집을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"
+                    1. 사실에 기반하여 친절하게 답변하세요.
+                    2. 관련 규정의 명칭과 해당 '페이지 번호'를 반드시 명시하세요.
+                    3. 내용이 없는 경우 "첨부된 자료에는 관련 정보가 없습니다."라고 답변하세요.
+                    4. 마지막 끝인사: "세부내용은 정관규정집을 다시 한번 확인하시기 바랍니다. 더 궁금하신 사항은 없으신가요?"
                     """
                     
-                    response = model.generate_content(prompt)
+                    # 파일과 프롬프트를 함께 전송 (매우 빠름)
+                    response = model.generate_content([doc_ref, prompt])
                     
                     st.markdown("### 💡 답변 결과")
-                    st.markdown(f'<div class="answer-box">{response.text}</div>', unsafe_allow_html=True)
+                    st.info(response.text)
                     
                 except Exception as e:
-                    st.error("⚠️ AI 서비스 응답 오류가 발생했습니다.")
-                    st.caption(f"Error Detail: {e}")
+                    # 404 모델명 에러에 대한 최후의 방어 코드
+                    if "404" in str(e):
+                        st.error("AI 모델 연결에 문제가 있습니다. 잠시 후 다시 시도해 주세요.")
+                    else:
+                        st.error(f"답변 생성 중 오류가 발생했습니다: {e}")
 
 if __name__ == "__main__":
     main()
